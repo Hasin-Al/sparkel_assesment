@@ -6,11 +6,13 @@ import json
 import sqlite3
 import hashlib
 import secrets
-from collections import Counter, defaultdict
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional, List
 
 import numpy as np
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +33,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 KB_PATH = os.path.join(os.path.dirname(__file__), "Knowledge_Bank.txt")
 DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
 TOP_K = 5
+MIN_RETRIEVAL_SCORE = 0.10  # hybrid scores are generally lower; tuned for BM25+dense
+BM25_WEIGHT = 0.4           # α for hybrid: score = α*bm25 + (1-α)*dense
+DENSE_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"  # 118MB, native Bengali support
 CONTEXT_WINDOW = 5  # last N turns kept for context
 FORBIDDEN_PHRASES = {
     "discount": [
@@ -52,6 +57,111 @@ FORBIDDEN_PHRASES = {
         "উপহার মোড়ক",
     ],
 }
+
+# ─────────────────────────── Text Normalization ───────────────────────────
+_BN_DIGIT_MAP = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+def _looks_spaced_bengali(text: str) -> bool:
+    # Detect very short, letter-spaced Bengali queries like "দা ম ক ত"
+    tokens = re.findall(r'[\u0980-\u09FF]+|[a-zA-Z0-9]+', text)
+    if not tokens:
+        return False
+    short = sum(1 for t in tokens if len(t) <= 2)
+    return (len(tokens) <= 5 and short == len(tokens)) or (len(tokens) <= 6 and short / len(tokens) >= 0.8)
+
+def normalize_text(text: str) -> str:
+    # Unicode normalization + cleanup for Bengali/English mixed text
+    text = unicodedata.normalize("NFKC", text)
+    # Remove zero-width characters
+    text = text.replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+    # Normalize Bengali letter YA variants
+    text = text.replace("\u09DF", "\u09AF\u09BC")  # য় -> য়
+    # Normalize Bengali precomposed variants to base+Nukta forms
+    text = text.replace("\u09DC", "\u09A1\u09BC")  # ড় -> ড়
+    text = text.replace("\u09DD", "\u09A2\u09BC")  # ঢ় -> ঢ়
+    # Normalize danda variations
+    text = text.replace("৷", "।")
+    # Normalize Bengali digits to ASCII digits
+    text = text.translate(_BN_DIGIT_MAP)
+    # Collapse spaces between Bengali letters only for "spaced-out" queries
+    if _looks_spaced_bengali(text):
+        text = re.sub(r'([\u0980-\u09FF])\s+(?=[\u0980-\u09FF])', r'\1', text)
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rsplit(" ", 1)[0].strip()
+
+def extract_product_facts(rag, product_name: str) -> dict:
+    docs = rag.docs_for_product(product_name)
+    facts = {
+        "has_discount": False,
+        "discount_sentence": "",
+        "has_money_amount": False,
+        "has_percent": False,
+        "warranty_brands": set(),
+        "fast_delivery": False,
+        "home_delivery": False,
+        "payment_methods": set(),
+        "rating": "",
+        "popular": False,
+        "best_selling": False,
+        "feature_sentence": "",
+    }
+
+    discount_phrases = ["ছাড়", "ছাড়", "বিশেষ অফার", "বিশেষ মূল্য", "discount"]
+    for doc in docs:
+        if "দ্রুত ডেলিভারি" in doc:
+            facts["fast_delivery"] = True
+        if "হোম ডেলিভারি" in doc:
+            facts["home_delivery"] = True
+        if "ক্যাশ অন ডেলিভারি" in doc:
+            facts["payment_methods"].add("ক্যাশ অন ডেলিভারি")
+        if "বিকাশ" in doc:
+            facts["payment_methods"].add("বিকাশ")
+        if "নগদ" in doc:
+            facts["payment_methods"].add("নগদ")
+        if "কার্ড" in doc:
+            facts["payment_methods"].add("কার্ড")
+        if "জনপ্রিয়" in doc or "বহুল ব্যবহৃত" in doc:
+            facts["popular"] = True
+        if "সবচেয়ে বেশি বিক্রিত" in doc or "সবচেয়ে বেশি বিক্রিত পণ্যগুলোর একটি" in doc:
+            facts["best_selling"] = True
+
+        # Rating
+        m = re.search(r"(\d+(?:\.\d+)?)\s*স্টার", doc)
+        if m and not facts["rating"]:
+            facts["rating"] = m.group(1)
+
+        # Warranty brands
+        for m in re.finditer(r"এই পণ্যের\s+([^\s]+)\s+ওয়ারেন্টি", doc):
+            facts["warranty_brands"].add(m.group(1))
+        for m in re.finditer(r"([^\s]+)\s+ওয়ারেন্টি", doc):
+            facts["warranty_brands"].add(m.group(1))
+
+        # Discount sentence
+        if not facts["discount_sentence"]:
+            for s in doc.split("।"):
+                s = s.strip()
+                if s and any(p in s for p in discount_phrases):
+                    facts["discount_sentence"] = truncate_text(s, 140)
+                    facts["has_discount"] = True
+                    facts["has_money_amount"] = bool(re.search(r"\d+\s*টাকা", s))
+                    facts["has_percent"] = bool(re.search(r"\d+\s*%|\d+\s*শতাংশ", s))
+                    break
+
+        # Feature sentence: pick the 2nd sentence if reasonable and not discount/gift
+        if not facts["feature_sentence"]:
+            sentences = [t.strip() for t in doc.split("।") if t.strip()]
+            if len(sentences) > 1:
+                cand = sentences[1]
+                if not any(p in cand for p in discount_phrases + ["গিফট র্যাপ", "উপহার"]):
+                    facts["feature_sentence"] = truncate_text(cand, 140)
+
+    return facts
 
 # Use PBKDF2-SHA256 to avoid bcrypt's 72-byte limit.
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
@@ -82,96 +192,207 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id)
         );
+        CREATE TABLE IF NOT EXISTS user_state (
+            user_id INTEGER PRIMARY KEY,
+            last_product TEXT,
+            last_intent TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
     """)
+    # Lightweight migration for existing DBs
+    try:
+        conn.execute("ALTER TABLE user_state ADD COLUMN last_intent TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
-# ─────────────────────────── TF-IDF RAG Engine ───────────────────────────
+def get_user_state(user_id: int) -> tuple[Optional[str], Optional[str]]:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT last_product, last_intent FROM user_state WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None, None
+    last_product = row["last_product"] if row["last_product"] else None
+    last_intent = row["last_intent"] if row["last_intent"] else None
+    return last_product, last_intent
+
+def set_user_state(user_id: int, product_name: Optional[str] = None, intent: Optional[str] = None):
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO user_state (user_id, last_product, last_intent, updated_at)
+        VALUES (?,?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            last_product=COALESCE(excluded.last_product, user_state.last_product),
+            last_intent=COALESCE(excluded.last_intent, user_state.last_intent),
+            updated_at=CURRENT_TIMESTAMP
+        """,
+        (user_id, product_name, intent)
+    )
+    conn.commit()
+    conn.close()
+
+# ─────────────────────────── BM25 + Dense Hybrid RAG Engine ───────────────────────────
 class RAGEngine:
+    _STOP_TOKENS = {"ও", "এবং", "অথবা", "and", "or", "the", "a", "an", "of", "for"}
+
     def __init__(self, kb_path: str):
         self.documents: List[str] = []
-        self.tfidf_matrix: Optional[np.ndarray] = None
-        self.vocab: dict = {}
-        self.idf: Optional[np.ndarray] = None
         self.product_names: set[str] = set()
+        self.product_name_tokens: List[List[str]] = []
+        self.product_docs: dict[str, List[int]] = {}
+        # BM25
+        self.bm25: Optional[BM25Okapi] = None
+        # Dense
+        self._model = SentenceTransformer(DENSE_MODEL)
+        self.doc_embeddings: Optional[np.ndarray] = None
         self._load_and_index(kb_path)
 
+    def _normalize_text(self, text: str) -> str:
+        return normalize_text(text)
+
     def _tokenize(self, text: str) -> List[str]:
-        # Handle Bengali + English tokens
-        text = text.lower()
-        tokens = re.findall(r'[\u0980-\u09FF]+|[a-zA-Z0-9]+', text)
-        return tokens
+        text = self._normalize_text(text).lower()
+        return re.findall(r'[\u0980-\u09FF]+|[a-zA-Z0-9]+', text)
 
     def _load_and_index(self, path: str):
         t0 = time.time()
         with open(path, encoding="utf-8") as f:
-            raw = f.read()
+            raw = f.read().replace("\r\n", "\n")
 
-        # Split by blank lines; each paragraph = one document
-        paras = [p.strip() for p in re.split(r'\n\s*\n', raw) if p.strip()]
+        # Split before normalization so we don't collapse paragraph boundaries
+        paras_raw = [p.strip() for p in re.split(r'\n\s*\n', raw) if p.strip()]
+        paras = [self._normalize_text(p) for p in paras_raw]
         self.documents = paras
-        n = len(paras)
+
         # Extract product names from first sentence of each paragraph
+        doc_tokens = []
         for p in paras:
             first_sentence = p.split("।", 1)[0].strip()
             if first_sentence:
-                self.product_names.add(first_sentence.lower())
+                name_norm = self._normalize_text(first_sentence).lower()
+                self.product_names.add(name_norm)
+                self.product_name_tokens.append(self._tokenize(first_sentence))
+                idx = len(doc_tokens)
+                self.product_docs.setdefault(name_norm, []).append(idx)
+            tokens = self._tokenize(p)
+            doc_tokens.append(tokens)
 
-        # Build vocabulary
-        doc_tokens = [self._tokenize(d) for d in paras]
-        all_tokens = set(t for tokens in doc_tokens for t in tokens)
-        self.vocab = {t: i for i, t in enumerate(sorted(all_tokens))}
-        V = len(self.vocab)
+        # BM25 index
+        self.bm25 = BM25Okapi(doc_tokens)
 
-        # TF matrix (n x V)
-        tf = np.zeros((n, V), dtype=np.float32)
-        for i, tokens in enumerate(doc_tokens):
-            cnt = Counter(tokens)
-            total = len(tokens) or 1
-            for tok, c in cnt.items():
-                if tok in self.vocab:
-                    tf[i, self.vocab[tok]] = c / total
+        # Dense embeddings — load from cache if KB hasn't changed, else encode & save
+        cache_path = path + ".embeddings.v5.npy"
+        kb_mtime = os.path.getmtime(path)
+        if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= kb_mtime:
+            print(f"[RAG] Loading cached embeddings from {cache_path}")
+            self.doc_embeddings = np.load(cache_path)
+        else:
+            print(f"[RAG] Encoding {len(paras)} documents with dense model (first run)...")
+            self.doc_embeddings = self._model.encode(
+                paras,
+                batch_size=64,
+                normalize_embeddings=True,
+                show_progress_bar=True,
+            ).astype(np.float32)
+            np.save(cache_path, self.doc_embeddings)
+            print(f"[RAG] Embeddings cached to {cache_path}")
 
-        # IDF
-        df = np.count_nonzero(tf, axis=0).astype(np.float32)
-        self.idf = np.log((n + 1) / (df + 1)) + 1.0
+        print(f"[RAG] Indexed {len(paras)} docs in {(time.time()-t0)*1000:.1f}ms")
 
-        # TF-IDF
-        tfidf = tf * self.idf
-        # L2 normalise rows
-        norms = np.linalg.norm(tfidf, axis=1, keepdims=True)
-        norms[norms == 0] = 1
-        self.tfidf_matrix = tfidf / norms
+    def _bm25_scores_normalised(self, query_tokens: List[str]) -> np.ndarray:
+        scores = self.bm25.get_scores(query_tokens).astype(np.float32)
+        max_s = scores.max()
+        if max_s > 0:
+            scores /= max_s
+        return scores
 
-        print(f"[RAG] Indexed {n} docs, vocab={V}, took {(time.time()-t0)*1000:.1f}ms")
+    def _dense_scores(self, query: str) -> np.ndarray:
+        qvec = self._model.encode(self._normalize_text(query), normalize_embeddings=True).astype(np.float32)
+        return self.doc_embeddings @ qvec  # cosine similarity
 
-    def _query_vector(self, query: str) -> np.ndarray:
-        tokens = self._tokenize(query)
-        cnt = Counter(tokens)
-        total = len(tokens) or 1
-        V = len(self.vocab)
-        vec = np.zeros(V, dtype=np.float32)
-        for tok, c in cnt.items():
-            if tok in self.vocab:
-                vec[self.vocab[tok]] = (c / total) * self.idf[self.vocab[tok]]
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec /= norm
-        return vec
-
-    def retrieve(self, query: str, top_k: int = TOP_K) -> List[str]:
+    def retrieve(self, query: str, top_k: int = TOP_K) -> tuple[List[str], float]:
         t0 = time.time()
-        qvec = self._query_vector(query)
-        scores = self.tfidf_matrix @ qvec  # cosine similarity
-        top_idx = np.argsort(scores)[::-1][:top_k]
-        results = [self.documents[i] for i in top_idx if scores[i] > 0.01]
-        elapsed = (time.time() - t0) * 1000
-        print(f"[RAG] Retrieval took {elapsed:.2f}ms, top_score={scores[top_idx[0]]:.4f}")
-        return results
+        tokens = self._tokenize(query)
+
+        bm25_s = self._bm25_scores_normalised(tokens)
+        dense_s = self._dense_scores(query)
+
+        # Hybrid: weighted sum
+        hybrid = BM25_WEIGHT * bm25_s + (1 - BM25_WEIGHT) * dense_s
+
+        top_idx = np.argsort(hybrid)[::-1][:top_k]
+        top_score = float(hybrid[top_idx[0]]) if len(top_idx) else 0.0
+        results = [self.documents[i] for i in top_idx if hybrid[i] > 0.01]
+
+        print(f"[RAG] Hybrid retrieval {(time.time()-t0)*1000:.1f}ms  top_score={top_score:.4f}")
+        return results, top_score
+
+    # ── Product-name helpers (unchanged logic, shared _STOP_TOKENS) ──
+
+    def _product_match_score(self, name_tokens: List[str], msg_tokens: set) -> float:
+        name_set = set(t for t in name_tokens if t not in self._STOP_TOKENS)
+        if not name_set:
+            return 0.0
+        overlap = len(name_set & msg_tokens)
+        if len(name_set) <= 2:
+            return 1.0 if name_set.issubset(msg_tokens) else 0.0
+        if overlap < 2:
+            return 0.0
+        ratio = overlap / len(name_set)
+        # Be a bit more permissive for longer product names
+        if len(name_set) >= 4 and ratio >= 0.4:
+            return ratio
+        return ratio if ratio >= 0.5 else 0.0
+
+    def matched_product_names(self, message: str) -> List[str]:
+        """Return KB product names that match the message (used to hint the LLM)."""
+        msg = self._normalize_text(message).lower()
+        matched = []
+        # Exact substring matches
+        for name in self.product_names:
+            if name in msg:
+                matched.append(name)
+        if matched:
+            return matched
+        # Token overlap matches
+        msg_tokens = set(t for t in self._tokenize(msg) if t not in self._STOP_TOKENS)
+        if not msg_tokens:
+            return []
+        for i, tokens in enumerate(self.product_name_tokens):
+            if self._product_match_score(tokens, msg_tokens) >= 0.5:
+                matched.append(" ".join(tokens))
+        # Deduplicate while preserving order
+        seen, out = set(), []
+        for m in matched:
+            if m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out
 
     def has_product_mention(self, message: str) -> bool:
-        msg = message.lower()
-        return any(name in msg for name in self.product_names)
+        return len(self.matched_product_names(message)) > 0
+
+    def retrieve_by_product_name(self, query: str, top_k: int = TOP_K) -> List[str]:
+        """Direct product-name lookup — fallback when hybrid score is still weak."""
+        msg_tokens = set(t for t in self._tokenize(query.lower()) if t not in self._STOP_TOKENS)
+        scored = [
+            (self._product_match_score(tokens, msg_tokens), i)
+            for i, tokens in enumerate(self.product_name_tokens)
+        ]
+        scored = [(s, i) for s, i in scored if s >= 0.5]
+        scored.sort(reverse=True)
+        return [self.documents[i] for _, i in scored[:top_k]]
+
+    def docs_for_product(self, product_name: str) -> List[str]:
+        key = self._normalize_text(product_name).lower()
+        idxs = self.product_docs.get(key, [])
+        return [self.documents[i] for i in idxs]
 
 
 # ─────────────────────────── Context Manager ───────────────────────────
@@ -187,13 +408,16 @@ class ContextManager:
         # Basic check: message mentions a product-like keyword
         indicators = ['কি', 'কী', 'কোথায়', 'কেন', 'কিভাবে', 'দাম', 'পণ্য',
                       'আছে', 'কত', 'what', 'how', 'price', 'product', 'buy']
-        msg_lower = message.lower()
+        msg_lower = normalize_text(message).lower()
         return any(ind in msg_lower for ind in indicators) and len(message) > 8
 
     @staticmethod
     def build_rag_query(message: str, history: List[dict]) -> str:
         """Augment sparse queries with recent context."""
-        if len(message.strip()) < 10 and history:
+        # Treat very short or token-light queries as follow-ups
+        msg = normalize_text(message)
+        tokens = re.findall(r'[\u0980-\u09FF]+|[a-zA-Z0-9]+', msg)
+        if (len(msg.strip()) < 10 or len(tokens) <= 3) and history:
             # Very short follow-up — prepend last user message for context
             last_user_msgs = [h['content'] for h in history if h['role'] == 'user'][-2:]
             context_str = ' '.join(last_user_msgs)
@@ -363,54 +587,214 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user)):
 
     # Build RAG query with context augmentation
     rag_query = ctx_manager.build_rag_query(req.message, history)
+    rag_query_norm = normalize_text(rag_query)
+
+    msg_lower = normalize_text(req.message).lower()
+    # Use normalized query to detect product mentions
+    matched_names = rag.matched_product_names(rag_query_norm)
+    product_in_query = len(matched_names) > 0
+
+    # Intent detection for follow-ups
+    is_price_query = any(k in msg_lower for k in ["দাম", "price", "কত টাকা", "টাকা কত"])
+    is_discount_query = any(k in msg_lower for k in ["ছাড়", "ছাড়", "discount", "অফার", "বিশেষ মূল্য"])
+    is_availability_query = any(k in msg_lower for k in ["বিক্রি", "কেনা", "পাওয়া যায়", "পাওয়া যায়", "sell", "buy", "available"])
+    is_feature_query = any(k in msg_lower for k in ["ফিচার", "বৈশিষ্ট্য", "features"])
+    is_warranty_query = any(k in msg_lower for k in ["ওয়ারেন্টি", "ওয়ারেন্টি", "warranty"])
+    is_delivery_query = any(k in msg_lower for k in ["ডেলিভারি", "ডেলিভারী", "delivery"])
+    is_payment_query = any(k in msg_lower for k in ["পেমেন্ট", "payment", "বিকাশ", "নগদ", "কার্ড"])
+    is_rating_query = any(k in msg_lower for k in ["রেটিং", "রিভিউ", "স্টার"])
+    is_popularity_query = any(k in msg_lower for k in ["জনপ্রিয়", "সবচেয়ে বেশি", "বিক্রিত", "বহুল ব্যবহৃত"])
+
+    followup_intent = any([
+        is_price_query,
+        is_discount_query,
+        is_availability_query,
+        is_feature_query,
+        is_warranty_query,
+        is_delivery_query,
+        is_payment_query,
+        is_rating_query,
+        is_popularity_query,
+    ])
+
+    # Primary intent (single)
+    primary_intent = None
+    if is_discount_query:
+        primary_intent = "discount"
+    elif is_price_query:
+        primary_intent = "price"
+    elif is_warranty_query:
+        primary_intent = "warranty"
+    elif is_delivery_query:
+        primary_intent = "delivery"
+    elif is_payment_query:
+        primary_intent = "payment"
+    elif is_feature_query:
+        primary_intent = "features"
+    elif is_rating_query:
+        primary_intent = "rating"
+    elif is_popularity_query:
+        primary_intent = "popularity"
+    elif is_availability_query:
+        primary_intent = "availability"
+
+    has_followup_cue = any(k in msg_lower for k in ["আর", "আরও", "এছাড়া", "এছাড়া", "আগেরটা", "ওটা", "এটা", "এইটা"])
+
+    # Context memory: inject last product for follow-up intents
+    last_product, last_intent = get_user_state(user_id)
+    if not product_in_query and last_product and followup_intent:
+        rag_query_norm = normalize_text(f"{last_product} {rag_query}")
+        matched_names = rag.matched_product_names(rag_query_norm)
+        product_in_query = len(matched_names) > 0
+
+    if not primary_intent and last_intent and has_followup_cue:
+        primary_intent = last_intent
 
     # Retrieve from KB
     t_ret = time.time()
-    kb_chunks = rag.retrieve(rag_query)
+    kb_chunks, top_score = rag.retrieve(rag_query_norm)
     retrieval_ms = (time.time() - t_ret) * 1000
 
-    msg_lower = req.message.lower()
-    # Use context-augmented query to detect the product for follow-up questions
-    product_in_query = rag.has_product_mention(rag_query)
-    is_price_query = any(k in msg_lower for k in ["দাম", "price", "কত টাকা", "টাকা কত"])
-    is_availability_query = any(k in msg_lower for k in ["বিক্রি", "কেনা", "পাওয়া যায়", "পাওয়া যায়", "sell", "buy", "available"])
+    has_kb_match = len(kb_chunks) > 0 and top_score >= MIN_RETRIEVAL_SCORE
+
+    # Fallback: direct product-name lookup before giving up.
+    if not has_kb_match and product_in_query:
+        fallback_chunks = rag.retrieve_by_product_name(rag_query_norm)
+        if fallback_chunks:
+            kb_chunks = fallback_chunks
+            has_kb_match = True
+
     has_price_info = any(("টাকা" in c) or re.search(r"\d", c) for c in kb_chunks)
 
-    if is_price_query and not product_in_query:
-        answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+    facts = extract_product_facts(rag, matched_names[0]) if matched_names else {}
+    discount_sentence = facts.get("discount_sentence", "")
+
+    decision = ""
+    raw_answer = ""
+    if matched_names and primary_intent:
+        if primary_intent == "availability":
+            answer = f"হ্যাঁ, আমাদের স্টোরে {matched_names[0]} পাওয়া যায়।"
+        elif primary_intent == "discount":
+            if discount_sentence:
+                if "টাকা" in msg_lower and not facts.get("has_money_amount"):
+                    answer = f"টাকার পরিমাণ উল্লেখ নেই, তবে {discount_sentence}।"
+                else:
+                    answer = f"{discount_sentence}।"
+            else:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        elif primary_intent == "warranty":
+            brands = sorted(facts.get("warranty_brands", []))
+            if brands:
+                answer = f"এই পণ্যে ওয়ারেন্টি আছে। ব্র্যান্ড: {', '.join(brands[:3])}।"
+            else:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        elif primary_intent == "delivery":
+            parts = []
+            if facts.get("fast_delivery"):
+                parts.append("দ্রুত ডেলিভারি পাওয়া যায়")
+            if facts.get("home_delivery"):
+                parts.append("সারা বাংলাদেশে হোম ডেলিভারি সুবিধা আছে")
+            if parts:
+                answer = "। ".join(parts) + "।"
+            else:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        elif primary_intent == "payment":
+            methods = sorted(facts.get("payment_methods", []))
+            if methods:
+                answer = f"পেমেন্ট অপশন: {', '.join(methods)}।"
+            else:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        elif primary_intent == "features":
+            if facts.get("feature_sentence"):
+                answer = f"{facts['feature_sentence']}।"
+            else:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        elif primary_intent == "rating":
+            if facts.get("rating"):
+                answer = f"গ্রাহকদের রিভিউ অনুযায়ী এটি {facts['rating']} স্টার রেটিং পেয়েছে।"
+            else:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        elif primary_intent == "popularity":
+            if facts.get("best_selling") or facts.get("popular"):
+                answer = "এই পণ্যটি বাংলাদেশের বাজারে জনপ্রিয় এবং বহুল ব্যবহৃত।"
+            else:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        elif primary_intent == "price":
+            if has_price_info:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+            else:
+                answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        else:
+            answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
         generation_ms = 0.0
-    elif is_availability_query and not product_in_query:
-        answer = "দুঃখিত, এই পণ্যটি আমাদের স্টোরে পাওয়া যায় না।"
-        generation_ms = 0.0
-    elif not kb_chunks:
-        answer = "দুঃখিত, এই পণ্যটি আমাদের স্টোরে পাওয়া যায় না।" if not product_in_query \
-            else "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        decision = f"{primary_intent}_intent"
+    elif not has_kb_match:
+        if is_price_query or is_availability_query or product_in_query:
+            answer = "দুঃখিত, এই পণ্যটি আমাদের স্টোরে পাওয়া যায় না।"
+            decision = "fallback_not_available"
+        else:
+            answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+            decision = "fallback_no_info"
         generation_ms = 0.0
     elif is_price_query and not has_price_info:
         answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+        decision = "price_no_info"
         generation_ms = 0.0
     else:
         # Build system prompt
+        # Limit KB context to avoid oversized prompt
+        max_kb_chars = 3500
         kb_context = "\n\n".join(kb_chunks)
-        system_prompt = f"""আপনি একটি বাংলাদেশি ই-কমার্স প্ল্যাটফর্মের সহায়ক চ্যাটবট। আপনি শুধুমাত্র নিচের জ্ঞান ভিত্তি (Knowledge Base) ব্যবহার করে উত্তর দেবেন।
+        kb_context = truncate_text(kb_context, max_kb_chars)
 
-নিয়মাবলী:
-১. সর্বদা বাংলায় উত্তর দিন।
-২. শুধুমাত্র Knowledge Base-এ থাকা তথ্য ব্যবহার করুন।
-৩. যদি কোনো পণ্য Knowledge Base-এ না থাকে, বলুন: "দুঃখিত, এই পণ্যটি আমাদের স্টোরে পাওয়া যায় না।"
-৪. যদি তথ্য Knowledge Base-এ না থাকে, বলুন: "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
-৫. উত্তর সংক্ষিপ্ত, স্পষ্ট ও সহায়ক রাখুন।
-৬. পূর্ববর্তী কথোপকথনের সাথে সামঞ্জস্য রেখে উত্তর দিন।
-৭. Knowledge Base-এ না থাকলে কোনো ডিসকাউন্ট/বিশেষ মূল্য বা গিফট র্যাপিং সুবিধা উল্লেখ করবেন না।
+        # Tell the LLM which products matched so it won't hallucinate other product names.
+        if matched_names:
+            names_str = ", ".join(f'"{n}"' for n in matched_names[:3])
+            product_hint = (
+                f"\n\n⚠️ CONFIRMED CATALOG MATCH: The following product(s) from the Knowledge Base "
+                f"match the user's query: {names_str}. "
+                "You MUST confirm these products are available in our store. Do NOT say they are unavailable."
+            )
+        else:
+            product_hint = ""
 
-Knowledge Base:
-{kb_context}"""
+        system_prompt = f"""You are a helpful Bengali e-commerce assistant. Your ONLY source of truth is the Knowledge Base provided below. Never use outside knowledge or assumptions.
+
+STRICT RULES (violating any rule is not allowed):
+1. Always reply in Bengali.
+2. Use ONLY information from the Knowledge Base — never invent, guess, or add anything from your own training.
+3. A product is "available" if and only if its name appears in the Knowledge Base. Partial name matches count — e.g., if the KB contains "এনালগ ও ডিজিটাল ঘড়ি" and the user asks about "ডিজিটাল ঘড়ি", the product IS available.
+4. If a product is NOT in the Knowledge Base → say exactly: "দুঃখিত, এই পণ্যটি আমাদের স্টোরে পাওয়া যায় না।"
+5. If information is NOT in the Knowledge Base → say exactly: "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+6. NEVER mention any product name that is not present in the retrieved Knowledge Base chunks below.
+7. NEVER mention discounts, special prices, or gift wrapping unless the Knowledge Base explicitly states it.
+8. Keep answers short, clear, and helpful.{product_hint}
+
+--- Knowledge Base (retrieved context) ---
+{kb_context}
+--- End of Knowledge Base ---"""
 
         # Build messages for LLM
+        # When a catalog product is matched, annotate the user message so the LLM
+        # cannot mistake a partial name ("ডিজিটাল ঘড়ি") for an unknown product.
+        if matched_names:
+            catalog_note = (
+                f"[CATALOG NOTE: The user is asking about a product. "
+                f"Our store sells: {', '.join(matched_names[:3])}. "
+                "This product IS available. Confirm availability and give details from the Knowledge Base.]"
+            )
+            user_msg_for_llm = f"{catalog_note}\n\n{req.message}"
+        else:
+            user_msg_for_llm = req.message
+
         messages = [{"role": "system", "content": system_prompt}]
+        # Keep history short to avoid prompt overflow
         for h in history[-CONTEXT_WINDOW:]:
-            messages.append({"role": h["role"], "content": h["content"]})
-        messages.append({"role": "user", "content": req.message})
+            messages.append({
+                "role": h["role"],
+                "content": truncate_text(h["content"], 400)
+            })
+        messages.append({"role": "user", "content": user_msg_for_llm})
 
         # Call Groq LLM
         if not groq_client:
@@ -421,16 +805,23 @@ Knowledge Base:
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
-                max_tokens=512,
+                max_tokens=256,
                 temperature=0.3,
             )
             raw_answer = response.choices[0].message.content.strip()
             answer = guard_answer(raw_answer, kb_context)
+            decision = "llm_answer"
         except Exception as e:
             raise HTTPException(500, f"LLM error: {str(e)}")
         generation_ms = (time.time() - t_gen) * 1000
 
     # Save to history
+    if matched_names or primary_intent:
+        set_user_state(
+            user_id,
+            product_name=matched_names[0] if matched_names else None,
+            intent=primary_intent
+        )
     conn.execute("INSERT INTO chat_history (user_id, role, content) VALUES (?,?,?)",
                  (user_id, "user", req.message))
     conn.execute("INSERT INTO chat_history (user_id, role, content) VALUES (?,?,?)",
@@ -438,11 +829,54 @@ Knowledge Base:
     conn.commit()
     conn.close()
 
+    # Debug logging
+    print(
+        "[CHAT]",
+        f"q='{req.message}'",
+        f"rag_q='{rag_query}'",
+        f"rag_q_norm='{rag_query_norm}'",
+        f"top_score={top_score:.4f}",
+        f"hits={len(kb_chunks)}",
+        f"has_kb_match={has_kb_match}",
+        f"matched_names={matched_names}",
+        f"last_product={last_product}",
+        f"last_intent={last_intent}",
+        f"followup_intent={followup_intent}",
+        f"primary_intent={primary_intent}",
+        f"discount_sentence={discount_sentence}",
+        f"decision={decision}",
+        f"retrieval_ms={retrieval_ms:.2f}",
+        f"generation_ms={generation_ms:.2f}",
+    )
+
     return {
         "answer": answer,
         "retrieval_ms": round(retrieval_ms, 2),
         "generation_ms": round(generation_ms, 2),
-        "kb_hits": len(kb_chunks)
+        "kb_hits": len(kb_chunks),
+        "debug": {
+            "rag_query": rag_query,
+            "rag_query_norm": rag_query_norm,
+            "top_score": round(top_score, 4),
+            "has_kb_match": has_kb_match,
+            "matched_names": matched_names,
+            "last_product": last_product,
+            "last_intent": last_intent,
+            "followup_intent": followup_intent,
+            "primary_intent": primary_intent,
+            "discount_sentence": discount_sentence,
+            "product_in_query": product_in_query,
+            "is_price_query": is_price_query,
+            "is_discount_query": is_discount_query,
+            "is_availability_query": is_availability_query,
+            "is_feature_query": is_feature_query,
+            "is_warranty_query": is_warranty_query,
+            "is_delivery_query": is_delivery_query,
+            "is_payment_query": is_payment_query,
+            "has_price_info": has_price_info,
+            "decision": decision,
+            "raw_answer": raw_answer,
+        }
     }
 
 @app.get("/api/history")
@@ -460,6 +894,7 @@ def get_history(current_user=Depends(get_current_user)):
 def clear_history(current_user=Depends(get_current_user)):
     conn = get_db()
     conn.execute("DELETE FROM chat_history WHERE user_id=?", (current_user["id"],))
+    conn.execute("DELETE FROM user_state WHERE user_id=?", (current_user["id"],))
     conn.commit()
     conn.close()
     return {"message": "History cleared"}
@@ -468,4 +903,4 @@ def clear_history(current_user=Depends(get_current_user)):
 # ─────────────────────────── Run ───────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
