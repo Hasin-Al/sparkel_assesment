@@ -246,6 +246,7 @@ class RAGEngine:
         self.product_names: set[str] = set()
         self.product_name_tokens: List[List[str]] = []
         self.product_docs: dict[str, List[int]] = {}
+        self.product_token_map: dict[str, List[str]] = {}
         # BM25
         self.bm25: Optional[BM25Okapi] = None
         # Dense
@@ -277,9 +278,15 @@ class RAGEngine:
             if first_sentence:
                 name_norm = self._normalize_text(first_sentence).lower()
                 self.product_names.add(name_norm)
-                self.product_name_tokens.append(self._tokenize(first_sentence))
+                name_tokens = self._tokenize(first_sentence)
+                self.product_name_tokens.append(name_tokens)
                 idx = len(doc_tokens)
                 self.product_docs.setdefault(name_norm, []).append(idx)
+                # Build token->product map for single-token matches
+                for tok in name_tokens:
+                    if tok in self._STOP_TOKENS or len(tok) < 2:
+                        continue
+                    self.product_token_map.setdefault(tok, []).append(name_norm)
             tokens = self._tokenize(p)
             doc_tokens.append(tokens)
 
@@ -367,6 +374,11 @@ class RAGEngine:
         for i, tokens in enumerate(self.product_name_tokens):
             if self._product_match_score(tokens, msg_tokens) >= 0.5:
                 matched.append(" ".join(tokens))
+        # Single-token fallback (e.g., "নুডুলস", "ঘড়ি")
+        if not matched:
+            for tok in msg_tokens:
+                if tok in self.product_token_map:
+                    matched.extend(self.product_token_map[tok][:3])
         # Deduplicate while preserving order
         seen, out = set(), []
         for m in matched:
@@ -374,6 +386,10 @@ class RAGEngine:
                 seen.add(m)
                 out.append(m)
         return out
+
+    def has_product_token(self, message: str) -> bool:
+        msg_tokens = set(t for t in self._tokenize(message.lower()) if t not in self._STOP_TOKENS)
+        return any(tok in self.product_token_map for tok in msg_tokens)
 
     def has_product_mention(self, message: str) -> bool:
         return len(self.matched_product_names(message)) > 0
@@ -593,6 +609,7 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user)):
     # Use normalized query to detect product mentions
     matched_names = rag.matched_product_names(rag_query_norm)
     product_in_query = len(matched_names) > 0
+    product_token_hit = rag.has_product_token(rag_query_norm)
 
     # Intent detection for follow-ups
     is_price_query = any(k in msg_lower for k in ["দাম", "price", "কত টাকা", "টাকা কত"])
@@ -642,10 +659,11 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user)):
 
     # Context memory: inject last product for follow-up intents
     last_product, last_intent = get_user_state(user_id)
-    if not product_in_query and last_product and followup_intent:
+    if not product_in_query and not product_token_hit and last_product and followup_intent:
         rag_query_norm = normalize_text(f"{last_product} {rag_query}")
         matched_names = rag.matched_product_names(rag_query_norm)
         product_in_query = len(matched_names) > 0
+        product_token_hit = rag.has_product_token(rag_query_norm)
 
     if not primary_intent and last_intent and has_followup_cue:
         primary_intent = last_intent
@@ -843,6 +861,7 @@ STRICT RULES (violating any rule is not allowed):
         f"last_intent={last_intent}",
         f"followup_intent={followup_intent}",
         f"primary_intent={primary_intent}",
+        f"product_token_hit={product_token_hit}",
         f"discount_sentence={discount_sentence}",
         f"decision={decision}",
         f"retrieval_ms={retrieval_ms:.2f}",
@@ -864,6 +883,7 @@ STRICT RULES (violating any rule is not allowed):
             "last_intent": last_intent,
             "followup_intent": followup_intent,
             "primary_intent": primary_intent,
+            "product_token_hit": product_token_hit,
             "discount_sentence": discount_sentence,
             "product_in_query": product_in_query,
             "is_price_query": is_price_query,
