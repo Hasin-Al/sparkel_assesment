@@ -458,13 +458,95 @@ class ContextManager:
         "কি", "কী", "কেমন", "কোথায়", "কেন", "কিভাবে", "কত", "দাম",
         "আছে", "রিভিউ", "রেটিং", "স্টার", "price", "review", "rating", "available"
     ]
+    _NON_CONTEXT_TOKENS = {
+        # Stop/connectors
+        "ও", "এবং", "অথবা", "and", "or", "the", "a", "an", "of", "for",
+        # Question/intent words
+        "কি", "কী", "কেমন", "কোথায়", "কেন", "কিভাবে", "কত", "দাম", "মূল্য",
+        "আছে", "রিভিউ", "রেটিং", "স্টার", "price", "review", "rating",
+        "available", "availability", "স্টক", "stock", "পাওয়া", "পাওয়া", "যায়", "যায়", "যাবে",
+        "কিনতে", "কিনব", "পারি", "পাব", "পাবেন", "বিক্রি", "sell", "buy",
+        "ডেলিভারি", "ডেলিভারী", "delivery", "ওয়ারেন্টি", "ওয়ারেন্টি", "warranty",
+        "ফিচার", "বৈশিষ্ট্য", "features", "discount", "অফার", "ছাড়", "ছাড়",
+        "পেমেন্ট", "payment", "বিকাশ", "নগদ", "কার্ড",
+        # Pronouns/determiners
+        "আমি", "আমরা", "আপনি", "আপনার", "আপনাদের", "তুমি", "তোমার", "তোমরা",
+        "সে", "তারা", "এটা", "ওটা", "এইটা", "ঐটা", "এই", "ঐ", "ওই", "এখানে", "ওখানে",
+        "আগেরটা", "পরেরটা",
+        # Greetings / fillers
+        "আসসালামু", "আলাইকুম", "সালাম", "হাই", "হ্যালো", "ভাই", "বোন", "ধন্যবাদ",
+        "কেমন", "আছেন", "আছো", "আছেন?", "জানাবেন",
+        # Shop words
+        "দোকান", "দোকানে", "স্টোর", "স্টোরে", "শপ", "শপে",
+    }
+    _CONJUNCTION_TOKENS = {"এবং", "ও", "অথবা", "and", "or", "&"}
 
     def __init__(self, rag_engine: "RAGEngine"):
         self.rag = rag_engine
 
     def _has_product_context(self, message: str) -> bool:
         msg_norm = normalize_text(message)
-        return self.rag.has_product_mention(msg_norm) or self.rag.has_product_token(msg_norm)
+        if self.rag.has_product_mention(msg_norm) or self.rag.has_product_token(msg_norm):
+            return True
+        # Heuristic: if there is any meaningful token left after removing
+        # question/intent/greeting words, treat it as having its own context.
+        tokens = self.rag._tokenize(msg_norm.lower())
+        content_tokens = [
+            t for t in tokens
+            if t not in self._NON_CONTEXT_TOKENS
+            and len(t) >= 2
+            and not t.isdigit()
+        ]
+        return len(content_tokens) > 0
+
+    def has_own_context(self, message: str) -> bool:
+        return self._has_product_context(message)
+
+    def extract_candidate_products(self, message: str) -> List[str]:
+        msg_norm = normalize_text(message)
+        tokens = self.rag._tokenize(msg_norm.lower())
+        candidates = [
+            t for t in tokens
+            if t not in self._NON_CONTEXT_TOKENS
+            and len(t) >= 2
+            and not t.isdigit()
+        ]
+        # Deduplicate while preserving order
+        seen, out = set(), []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
+
+    def is_multi_product(self, message: str) -> bool:
+        msg_norm = normalize_text(message)
+        tokens = self.rag._tokenize(msg_norm.lower())
+        has_conj = any(t in self._CONJUNCTION_TOKENS for t in tokens) or ("," in msg_norm)
+        if not has_conj:
+            return False
+        candidates = self.extract_candidate_products(msg_norm)
+        return len(candidates) >= 2
+
+    def extract_recent_products_with_candidates(self, history: List[dict]) -> tuple[List[str], List[str], bool]:
+        """
+        Returns (known_products, candidate_products, has_multi) from the most recent user
+        message that has its own context.
+        """
+        for h in reversed(history):
+            if h.get("role") != "user":
+                continue
+            h_norm = normalize_text(h.get("content", ""))
+            if not self._has_product_context(h_norm):
+                continue
+            candidates = self.extract_candidate_products(h_norm)
+            names = self.rag.matched_product_names(h_norm)
+            if names:
+                names = [n.split(",")[0].strip() for n in names]
+            has_multi = self.is_multi_product(h_norm)
+            if candidates or names:
+                return names, candidates, has_multi
+        return [], [], False
 
     def _extract_recent_products(self, history: List[dict]) -> List[str]:
         # Find the most recent user message that mentions products
@@ -472,10 +554,6 @@ class ContextManager:
             if h.get("role") != "user":
                 continue
             h_norm = normalize_text(h.get("content", ""))
-            # Skip messages that had an unknown brand qualifier — they didn't match any
-            # real KB product, so we must not let them pollute the context for later queries.
-            if self.rag.has_unknown_product_qualifiers(h_norm):
-                continue
             names = self.rag.matched_product_names(h_norm)
             if names:
                 # KB product names may include a comma + description (e.g. "তাজা পাউরুটি, প্রতিদিন...").
@@ -545,6 +623,107 @@ def guard_answer(answer: str, kb_context: str) -> str:
     if cleaned:
         return cleaned
     return "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+
+
+def _join_products(items: List[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} ও {items[1]}"
+    return ", ".join(items[:-1]) + " ও " + items[-1]
+
+
+def _resolve_product_name_from_token(rag: "RAGEngine", token: str) -> Optional[str]:
+    candidates = rag.product_token_map.get(token, [])
+    if not candidates:
+        return None
+    unique = sorted(set(candidates), key=lambda s: (len(s), s))
+    return unique[0]
+
+
+def _product_has_price_info(rag: "RAGEngine", product_name: str) -> bool:
+    docs = rag.docs_for_product(product_name)
+    return any(re.search(r"\d+\s*টাকা", d) for d in docs)
+
+
+def _build_multi_product_answer(
+    rag: "RAGEngine",
+    terms: List[str],
+    intent: Optional[str],
+    msg_lower: str,
+) -> Optional[str]:
+    if not intent:
+        return None
+    parts: List[str] = []
+    for term in terms:
+        term_norm = normalize_text(term).lower()
+        product_name = None
+        if term in rag.product_token_map:
+            product_name = _resolve_product_name_from_token(rag, term)
+        elif term_norm in rag.product_names:
+            product_name = term
+        if product_name:
+            facts = extract_product_facts(rag, product_name)
+            if intent == "availability":
+                parts.append(f"হ্যাঁ, আমাদের স্টোরে {term} পাওয়া যায়।")
+            elif intent == "discount":
+                disc = facts.get("discount_sentence", "")
+                if disc:
+                    if ("টাকা" in msg_lower) and not facts.get("has_money_amount"):
+                        parts.append(f"{term} সম্পর্কে টাকার পরিমাণ উল্লেখ নেই, তবে {disc}।")
+                    else:
+                        parts.append(f"{term} সম্পর্কে {disc}।")
+                else:
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+            elif intent == "warranty":
+                brands = sorted(facts.get("warranty_brands", []))
+                if brands:
+                    parts.append(f"{term} এর ওয়ারেন্টি আছে। ব্র্যান্ড: {', '.join(brands[:3])}।")
+                else:
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+            elif intent == "delivery":
+                p = []
+                if facts.get("fast_delivery"):
+                    p.append("দ্রুত ডেলিভারি পাওয়া যায়")
+                if facts.get("home_delivery"):
+                    p.append("সারা বাংলাদেশে হোম ডেলিভারি সুবিধা আছে")
+                if p:
+                    parts.append(f"{term} সম্পর্কে " + "। ".join(p) + "।")
+                else:
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+            elif intent == "payment":
+                methods = sorted(facts.get("payment_methods", []))
+                if methods:
+                    parts.append(f"{term} এর পেমেন্ট অপশন: {', '.join(methods)}।")
+                else:
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+            elif intent == "features":
+                if facts.get("feature_sentence"):
+                    parts.append(f"{term} সম্পর্কে {facts['feature_sentence']}।")
+                else:
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+            elif intent == "rating":
+                if facts.get("rating"):
+                    parts.append(f"{term} এর রিভিউ অনুযায়ী এটি {facts['rating']} স্টার রেটিং পেয়েছে।")
+                else:
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+            elif intent == "popularity":
+                if facts.get("best_selling") or facts.get("popular"):
+                    parts.append(f"{term} বাংলাদেশের বাজারে জনপ্রিয় এবং বহুল ব্যবহৃত।")
+                else:
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+            elif intent == "price":
+                if product_name and _product_has_price_info(rag, product_name):
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+                else:
+                    parts.append(f"দুঃখিত, {term} সম্পর্কে এই বিষয়ে আমাদের কাছে তথ্য নেই।")
+            else:
+                return None
+        else:
+            parts.append(f"দুঃখিত, {term} আমাদের স্টোরে পাওয়া যায় না।")
+    return " ".join(parts) if parts else None
 
 
 # ─────────────────────────── Auth Helpers ───────────────────────────
@@ -678,16 +857,33 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user)):
     msg_matched_names = rag.matched_product_names(msg_norm)
     msg_product_token_hit = rag.has_product_token(msg_norm)
     product_in_msg = len(msg_matched_names) > 0 or msg_product_token_hit
+    msg_has_own_context = ctx_manager.has_own_context(msg_norm)
+    multi_product = ctx_manager.is_multi_product(msg_norm)
+    multi_candidates = ctx_manager.extract_candidate_products(msg_norm) if multi_product else []
+    recent_known, recent_candidates, recent_has_multi = ([], [], False)
+    if not msg_has_own_context:
+        recent_known, recent_candidates, recent_has_multi = ctx_manager.extract_recent_products_with_candidates(history)
+    multi_targets = []
+    if msg_has_own_context and multi_product:
+        if len(msg_matched_names) >= 2:
+            multi_targets = [n.split(",")[0].strip() for n in msg_matched_names]
+        else:
+            multi_targets = multi_candidates
+    elif (not msg_has_own_context) and recent_has_multi:
+        if len(recent_known) >= 2:
+            multi_targets = recent_known
+        elif len(recent_candidates) >= 2:
+            multi_targets = recent_candidates
 
     # If the message has a known product token but ALSO has an unknown brand/qualifier
     # (e.g. "নাইকি জুতা আছে?") → treat it as "not in store" so we don't answer about
     # the generic product and don't pollute last_product with a wrong match.
-    has_unknown_brand = product_in_msg and rag.has_unknown_product_qualifiers(msg_norm)
+    has_unknown_brand = (not multi_product) and product_in_msg and rag.has_unknown_product_qualifiers(msg_norm)
 
     # Intent detection for follow-ups
     is_price_query = any(k in msg_lower for k in ["দাম", "price", "কত টাকা", "টাকা কত"])
     is_discount_query = any(k in msg_lower for k in ["ছাড়", "ছাড়", "discount", "অফার", "বিশেষ মূল্য"])
-    is_availability_query = any(k in msg_lower for k in ["বিক্রি", "কেনা", "পাওয়া যায়", "পাওয়া যায়", "আছে", "sell", "buy", "available"])
+    is_availability_query = any(k in msg_lower for k in ["বিক্রি", "কেনা", "পাওয়া যায়", "পাওয়া যায়", "পাওয়া যাবে", "পাওয়া যাবে", "আছে", "sell", "buy", "available"])
     is_feature_query = any(k in msg_lower for k in ["ফিচার", "বৈশিষ্ট্য", "features"])
     is_warranty_query = any(k in msg_lower for k in ["ওয়ারেন্টি", "ওয়ারেন্টি", "warranty"])
     is_delivery_query = any(k in msg_lower for k in ["ডেলিভারি", "ডেলিভারী", "delivery"])
@@ -747,7 +943,7 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user)):
     # Context memory: fallback to last product from state if history didn't help
     last_product, last_intent = get_user_state(user_id)
     if (
-        not product_in_msg
+        not msg_has_own_context
         and last_product
         and (followup_intent or has_followup_cue or ctx_manager._is_question_like(req.message))
         and rag_query == req.message
@@ -785,7 +981,25 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user)):
     # Brand mismatch: user asked for a specific brand not in our KB
     # (e.g. "নাইকি জুতা আছে?" — নাইকি is unknown, জুতা is a generic KB product).
     # Return "not available" immediately and don't store anything as last_product.
-    if has_unknown_brand:
+    if multi_targets and primary_intent:
+        multi_answer = _build_multi_product_answer(rag, multi_targets, primary_intent, msg_lower)
+        if multi_answer:
+            answer = multi_answer
+            decision = "multi_product_intent"
+            generation_ms = 0.0
+            # Update last_product with known tokens only
+            known_multi = []
+            for t in multi_targets:
+                t_norm = normalize_text(t).lower()
+                if t in rag.product_token_map or t_norm in rag.product_names:
+                    known_multi.append(t)
+            matched_names = known_multi
+        else:
+            answer = "দুঃখিত, এই বিষয়ে আমাদের কাছে তথ্য নেই।"
+            decision = "multi_product_no_info"
+            generation_ms = 0.0
+            matched_names = []
+    elif has_unknown_brand:
         answer = "দুঃখিত, এই পণ্যটি আমাদের স্টোরে পাওয়া যায় না।"
         decision = "unknown_brand"
         generation_ms = 0.0
