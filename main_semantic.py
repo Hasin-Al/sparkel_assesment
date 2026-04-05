@@ -239,7 +239,7 @@ def get_user_state(user_id: int) -> tuple[Optional[str], Optional[str], bool]:
     known = True
     try:
         if row["last_product_known"] is not None:
-            known = bool(row["last_product_known"])
+            known = bool(int(row["last_product_known"]))
     except Exception:
         known = True
     # Backward compatibility if old data used __UNK__ prefix
@@ -820,6 +820,21 @@ def _clean_product_names(items: List[str], limit: int = 5) -> List[str]:
     return out
 
 
+def _intent_label_bn(intent: Optional[str]) -> str:
+    mapping = {
+        "rating": "রিভিউ",
+        "price": "দাম",
+        "warranty": "ওয়ারেন্টি",
+        "delivery": "ডেলিভারি",
+        "features": "বৈশিষ্ট্য",
+        "discount": "ছাড়",
+        "payment": "পেমেন্ট",
+        "availability": "উপলব্ধতা",
+        "popularity": "জনপ্রিয়তা",
+    }
+    return mapping.get(intent, "তথ্য")
+
+
 def _resolve_product_name_from_token(rag: "RAGEngine", token: str) -> Optional[str]:
     candidates = rag.product_token_map.get(token, [])
     if not candidates:
@@ -1171,7 +1186,7 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user)):
     # Context memory: fallback to last product from state (used only if semantic context not applied)
     last_product, last_intent, last_product_known = get_user_state(user_id)
 
-    if not primary_intent and last_intent and has_followup_cue:
+    if not primary_intent and last_intent and (has_followup_cue or product_in_query):
         primary_intent = last_intent
 
     # General-chat fallback (non-product queries)
@@ -1438,7 +1453,7 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user)):
         if len(matched_names) > 1 and primary_intent in {"rating", "price", "warranty", "delivery", "features", "discount"}:
             variants = _clean_product_names(matched_names, limit=5)
             variants_str = _join_products(variants)
-            answer = f"একাধিক ভ্যারিয়েন্ট আছে: {variants_str}। আপনি কোনটির {primary_intent} জানতে চান?"
+            answer = f"একাধিক ভ্যারিয়েন্ট আছে: {variants_str}। আপনি কোনটির {_intent_label_bn(primary_intent)} জানতে চান?"
             decision = "variant_clarify"
             generation_ms = 0.0
         else:
